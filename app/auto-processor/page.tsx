@@ -96,7 +96,6 @@ export default function AutoProcessorPage() {
     setIsLoadingQueue(true);
     setQueueError(null);
     try {
-      // Added ?include_active=true so frontend always sees processing items too
       const res = await fetch(`/api/auto-process/queue?type=${queueType}&include_active=true`);
       const data = await res.json();
       if (data.status === 'success') {
@@ -171,7 +170,6 @@ export default function AutoProcessorPage() {
               if (!line.trim()) continue;
               try {
                 const data = JSON.parse(line);
-
                 if (data.msg) addLog(data.msg, data.type || 'info', data.step);
                 if (data.step) setCurrentStep(data.step);
                 if (data.progress) setLinkProgress(data.progress);
@@ -179,8 +177,7 @@ export default function AutoProcessorPage() {
                 if (data.step === 'done') {
                   result = {
                     queueItem: item,
-                    // FIX: Capture exact status ('processing', 'completed', 'failed')
-                    status: data.status, 
+                    status: data.status,
                     savedId: data.savedId,
                     savedCollection: data.savedCollection,
                     title: data.title || item.title,
@@ -205,7 +202,7 @@ export default function AutoProcessorPage() {
   );
 
   // =============================================
-  // Start Auto-Processing (SYNCHRONOUS LOOP)
+  // Start Auto-Processing (SYNCHRONOUS LOOP WITH RETRY)
   // =============================================
   const startProcessing = useCallback(async () => {
     if (queueItems.length === 0) {
@@ -223,8 +220,8 @@ export default function AutoProcessorPage() {
     setLogs([]);
     setShowResults(false);
 
-    addLog(`🚀 Starting Auto-Processor (STRICT SYNCHRONOUS MODE)`, 'success');
-    addLog(`⚙️ No timeouts. Waiting for full completion of each URL.`, 'info');
+    addLog(`🚀 Starting Auto-Processor (AUTO-RETRY MODE)`, 'success');
+    addLog(`⚙️ Each URL will have 3 retry attempts on failure.`, 'info');
     addLog('─'.repeat(50), 'info');
 
     const itemsToProcess = [...queueItems];
@@ -242,14 +239,16 @@ export default function AutoProcessorPage() {
       setCurrentStep('extract');
 
       addLog('═'.repeat(50), 'info');
-      addLog(`📦 [${i + 1}/${itemsToProcess.length}] Processing: "${item.title}"`, 'info');
+      addLog(`📦 [${i + 1}/${itemsToProcess.length}] Target: "${item.title}"`, 'info');
 
-      // THE MAGIC FIX: Inner Loop for Checkpointing
+      // NEW LOGIC: Inner Loop for Checkpointing + Auto-Retry
       let itemDone = false;
       let finalResult: ProcessedItem | null = null;
+      let consecutiveFails = 0; // Tracks consecutive failures for the SAME item
+      const MAX_RETRIES = 3;
 
       while (!itemDone && !abortRef.current) {
-        // Handle pause inside the inner loop
+        // Handle pause
         while (pauseRef.current && !abortRef.current) {
           await new Promise((r) => setTimeout(r, 500));
         }
@@ -258,13 +257,27 @@ export default function AutoProcessorPage() {
         const result = await processSingleItem(item);
 
         if (result.status === 'processing') {
-          // Checkpoint hit! Vercel ran out of time, but we resume instantly
-          addLog(`⏳ Checkpoint Reached. Resuming "${item.title}" from last link...`, 'warn');
-          // DO NOT set itemDone = true. The while loop will trigger processSingleItem AGAIN!
-        } else {
-          // 'completed' or 'failed' - Task is 100% finished
+          // Progress is being made (Vercel timed out, but we resume)
+          addLog(`⏳ Checkpoint: Resuming "${item.title}"...`, 'warn');
+          consecutiveFails = 0; // Reset fails because we are technically moving forward
+        } 
+        else if (result.status === 'completed') {
+          // Success!
           itemDone = true;
           finalResult = result;
+        } 
+        else if (result.status === 'failed') {
+          // Genuine failure or error
+          consecutiveFails++;
+          
+          if (consecutiveFails < MAX_RETRIES) {
+            addLog(`⚠️ Attempt ${consecutiveFails} failed. Retrying in 2s...`, 'error');
+            await new Promise((r) => setTimeout(r, 2000));
+          } else {
+            addLog(`❌ Final Strike: Skipping "${item.title}" after ${MAX_RETRIES} attempts.`, 'error');
+            itemDone = true;
+            finalResult = result;
+          }
         }
       }
 
@@ -274,11 +287,10 @@ export default function AutoProcessorPage() {
       setProcessedItems((prev) => [...prev, finalResult]);
 
       if (finalResult.status === 'completed') {
-        addLog(`✅ [${i + 1}/${itemsToProcess.length}] "${finalResult.title}" — SAVED FULLY`, 'success');
+        addLog(`✅ [${i + 1}/${itemsToProcess.length}] "${finalResult.title}" — COMPLETED`, 'success');
       } else {
-        addLog(`❌ [${i + 1}/${itemsToProcess.length}] "${item.title}" — FAILED: ${finalResult.error}`, 'error');
+        addLog(`❌ [${i + 1}/${itemsToProcess.length}] "${item.title}" — FAILED`, 'error');
       }
-      // REMOVED THE ARTIFICIAL DELAY HERE! Instantly moves to next URL.
     }
 
     addLog('─'.repeat(50), 'info');
@@ -402,7 +414,7 @@ export default function AutoProcessorPage() {
                 </>
               )}
             </div>
-            {/* TIMER SELECTOR HAS BEEN COMPLETELY REMOVED FROM HERE! */}
+            {/* NO TIMER UI - AS REQUESTED */}
           </div>
 
           {queueError && (
