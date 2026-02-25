@@ -12,14 +12,13 @@ import {
   Film,
   Tv,
   RotateCcw,
-  Trash2,
-  ChevronDown,
-  ChevronRight,
+  Database,
+  ArrowLeft,
   AlertTriangle,
   Coffee,
   Rocket,
-  Database,
-  ArrowLeft,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import Link from 'next/link';
 
@@ -44,7 +43,7 @@ interface LogEntry {
 
 interface ProcessedItem {
   queueItem: QueueItem;
-  status: 'completed' | 'failed' | 'skipped';
+  status: 'completed' | 'failed' | 'processing' | 'skipped';
   savedId?: string;
   savedCollection?: string;
   successfulLinks?: number;
@@ -78,9 +77,6 @@ export default function AutoProcessorPage() {
   const [showLogs, setShowLogs] = useState(true);
   const [showResults, setShowResults] = useState(false);
 
-  // Delay
-  const [delaySeconds, setDelaySeconds] = useState(7);
-
   // Refs for abort control
   const abortRef = useRef(false);
   const pauseRef = useRef(false);
@@ -100,7 +96,8 @@ export default function AutoProcessorPage() {
     setIsLoadingQueue(true);
     setQueueError(null);
     try {
-      const res = await fetch(`/api/auto-process/queue?type=${queueType}`);
+      // Added ?include_active=true so frontend always sees processing items too
+      const res = await fetch(`/api/auto-process/queue?type=${queueType}&include_active=true`);
       const data = await res.json();
       if (data.status === 'success') {
         setQueueItems(data.items);
@@ -153,11 +150,7 @@ export default function AutoProcessorPage() {
           if (!res.ok || !res.body) {
             const err = await res.text();
             addLog(`❌ API Error: ${err}`, 'error');
-            resolve({
-              queueItem: item,
-              status: 'failed',
-              error: err,
-            });
+            resolve({ queueItem: item, status: 'failed', error: err });
             return;
           }
 
@@ -179,26 +172,15 @@ export default function AutoProcessorPage() {
               try {
                 const data = JSON.parse(line);
 
-                // Log the message
-                if (data.msg) {
-                  addLog(data.msg, data.type || 'info', data.step);
-                }
+                if (data.msg) addLog(data.msg, data.type || 'info', data.step);
+                if (data.step) setCurrentStep(data.step);
+                if (data.progress) setLinkProgress(data.progress);
 
-                // Update current step
-                if (data.step) {
-                  setCurrentStep(data.step);
-                }
-
-                // Update link progress
-                if (data.progress) {
-                  setLinkProgress(data.progress);
-                }
-
-                // Final result
                 if (data.step === 'done') {
                   result = {
                     queueItem: item,
-                    status: data.status === 'completed' ? 'completed' : 'failed',
+                    // FIX: Capture exact status ('processing', 'completed', 'failed')
+                    status: data.status, 
                     savedId: data.savedId,
                     savedCollection: data.savedCollection,
                     title: data.title || item.title,
@@ -208,19 +190,14 @@ export default function AutoProcessorPage() {
                   };
                 }
               } catch {
-                // ignore parse errors for incomplete lines
+                // ignore parse errors
               }
             }
           }
-
           resolve(result);
         } catch (e: any) {
           addLog(`❌ Network Error: ${e.message}`, 'error');
-          resolve({
-            queueItem: item,
-            status: 'failed',
-            error: e.message,
-          });
+          resolve({ queueItem: item, status: 'failed', error: e.message });
         }
       });
     },
@@ -228,25 +205,7 @@ export default function AutoProcessorPage() {
   );
 
   // =============================================
-  // Sleep helper with pause support
-  // =============================================
-  const sleepWithPause = useCallback(
-    async (seconds: number) => {
-      for (let i = seconds; i > 0; i--) {
-        if (abortRef.current) return;
-        while (pauseRef.current) {
-          await new Promise((r) => setTimeout(r, 500));
-          if (abortRef.current) return;
-        }
-        addLog(`⏳ Waiting ${i}s before next item...`, 'info');
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-    },
-    [addLog]
-  );
-
-  // =============================================
-  // Start Auto-Processing
+  // Start Auto-Processing (SYNCHRONOUS LOOP)
   // =============================================
   const startProcessing = useCallback(async () => {
     if (queueItems.length === 0) {
@@ -264,8 +223,8 @@ export default function AutoProcessorPage() {
     setLogs([]);
     setShowResults(false);
 
-    addLog(`🚀 Starting Auto-Processor: ${queueItems.length} items in queue`, 'success');
-    addLog(`⚙️ Delay between items: ${delaySeconds}s`, 'info');
+    addLog(`🚀 Starting Auto-Processor (STRICT SYNCHRONOUS MODE)`, 'success');
+    addLog(`⚙️ No timeouts. Waiting for full completion of each URL.`, 'info');
     addLog('─'.repeat(50), 'info');
 
     const itemsToProcess = [...queueItems];
@@ -276,12 +235,6 @@ export default function AutoProcessorPage() {
         break;
       }
 
-      // Handle pause
-      while (pauseRef.current && !abortRef.current) {
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      if (abortRef.current) break;
-
       const item = itemsToProcess[i];
       setCurrentIndex(i + 1);
       setCurrentItem(item);
@@ -289,32 +242,43 @@ export default function AutoProcessorPage() {
       setCurrentStep('extract');
 
       addLog('═'.repeat(50), 'info');
-      addLog(
-        `📦 [${i + 1}/${itemsToProcess.length}] Processing: "${item.title}"`,
-        'info'
-      );
-      addLog(`🔗 URL: ${item.url}`, 'info');
-      addLog(`📂 Queue: ${item.collection} | Type: ${item.type}`, 'info');
+      addLog(`📦 [${i + 1}/${itemsToProcess.length}] Processing: "${item.title}"`, 'info');
 
-      const result = await processSingleItem(item);
-      setProcessedItems((prev) => [...prev, result]);
+      // THE MAGIC FIX: Inner Loop for Checkpointing
+      let itemDone = false;
+      let finalResult: ProcessedItem | null = null;
 
-      if (result.status === 'completed') {
-        addLog(
-          `✅ [${i + 1}/${itemsToProcess.length}] "${result.title}" — SAVED (${result.successfulLinks} links)`,
-          'success'
-        );
+      while (!itemDone && !abortRef.current) {
+        // Handle pause inside the inner loop
+        while (pauseRef.current && !abortRef.current) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        if (abortRef.current) break;
+
+        const result = await processSingleItem(item);
+
+        if (result.status === 'processing') {
+          // Checkpoint hit! Vercel ran out of time, but we resume instantly
+          addLog(`⏳ Checkpoint Reached. Resuming "${item.title}" from last link...`, 'warn');
+          // DO NOT set itemDone = true. The while loop will trigger processSingleItem AGAIN!
+        } else {
+          // 'completed' or 'failed' - Task is 100% finished
+          itemDone = true;
+          finalResult = result;
+        }
+      }
+
+      if (abortRef.current) break;
+      if (!finalResult) continue;
+
+      setProcessedItems((prev) => [...prev, finalResult]);
+
+      if (finalResult.status === 'completed') {
+        addLog(`✅ [${i + 1}/${itemsToProcess.length}] "${finalResult.title}" — SAVED FULLY`, 'success');
       } else {
-        addLog(
-          `❌ [${i + 1}/${itemsToProcess.length}] "${item.title}" — FAILED: ${result.error}`,
-          'error'
-        );
+        addLog(`❌ [${i + 1}/${itemsToProcess.length}] "${item.title}" — FAILED: ${finalResult.error}`, 'error');
       }
-
-      // Wait before next item (unless it's the last one)
-      if (i < itemsToProcess.length - 1 && !abortRef.current) {
-        await sleepWithPause(delaySeconds);
-      }
+      // REMOVED THE ARTIFICIAL DELAY HERE! Instantly moves to next URL.
     }
 
     addLog('─'.repeat(50), 'info');
@@ -325,10 +289,8 @@ export default function AutoProcessorPage() {
     setCurrentStep('');
     setLinkProgress(null);
     setShowResults(true);
-
-    // Refresh queue
     fetchQueue();
-  }, [queueItems, delaySeconds, addLog, processSingleItem, sleepWithPause, fetchQueue]);
+  }, [queueItems, addLog, processSingleItem, fetchQueue]);
 
   // =============================================
   // Stop / Pause
@@ -367,10 +329,7 @@ export default function AutoProcessorPage() {
       {/* Header */}
       <div className="sticky top-0 z-50 bg-[#0a0a0a]/90 backdrop-blur-xl border-b border-white/5">
         <div className="max-w-4xl mx-auto px-4 py-3 flex items-center gap-3">
-          <Link
-            href="/"
-            className="p-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-all"
-          >
+          <Link href="/" className="p-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-all">
             <ArrowLeft className="w-4 h-4" />
           </Link>
           <div className="flex items-center gap-2">
@@ -393,7 +352,6 @@ export default function AutoProcessorPage() {
       <div className="max-w-4xl mx-auto px-4 py-6 space-y-6">
         {/* ==================== CONTROLS ==================== */}
         <div className="bg-white/[0.02] border border-white/5 rounded-2xl p-5">
-          {/* Queue Type Selector */}
           <div className="flex items-center gap-2 mb-4">
             <span className="text-xs text-slate-500 font-bold uppercase">Queue:</span>
             {(['all', 'movies', 'webseries'] as const).map((type) => (
@@ -423,7 +381,6 @@ export default function AutoProcessorPage() {
             </button>
           </div>
 
-          {/* Queue Status */}
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-3">
               <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl px-3 py-2">
@@ -445,24 +402,7 @@ export default function AutoProcessorPage() {
                 </>
               )}
             </div>
-
-            {/* Delay Control */}
-            <div className="flex items-center gap-2">
-              <label className="text-[10px] text-slate-500 font-bold uppercase">Delay:</label>
-              <select
-                value={delaySeconds}
-                onChange={(e) => setDelaySeconds(Number(e.target.value))}
-                disabled={isProcessing}
-                className="bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-slate-300 disabled:opacity-50"
-              >
-                <option value={3}>3s</option>
-                <option value={5}>5s</option>
-                <option value={7}>7s</option>
-                <option value={10}>10s</option>
-                <option value={15}>15s</option>
-                <option value={20}>20s</option>
-              </select>
-            </div>
+            {/* TIMER SELECTOR HAS BEEN COMPLETELY REMOVED FROM HERE! */}
           </div>
 
           {queueError && (
@@ -472,7 +412,6 @@ export default function AutoProcessorPage() {
             </div>
           )}
 
-          {/* Action Buttons */}
           <div className="flex items-center gap-3">
             {!isProcessing ? (
               <button
@@ -493,15 +432,7 @@ export default function AutoProcessorPage() {
                       : 'bg-amber-500/20 border border-amber-500/30 text-amber-400 hover:bg-amber-500/30'
                   }`}
                 >
-                  {isPaused ? (
-                    <>
-                      <Play className="w-5 h-5" /> Resume
-                    </>
-                  ) : (
-                    <>
-                      <Coffee className="w-5 h-5" /> Pause
-                    </>
-                  )}
+                  {isPaused ? <><Play className="w-5 h-5" /> Resume</> : <><Coffee className="w-5 h-5" /> Pause</>}
                 </button>
                 <button
                   onClick={stopProcessing}
@@ -526,25 +457,18 @@ export default function AutoProcessorPage() {
               <span className="text-sm font-bold text-white">{progressPercent}%</span>
             </div>
 
-            {/* Main progress bar */}
             <div className="w-full h-3 bg-white/5 rounded-full overflow-hidden mb-3">
               <div
                 className="h-full rounded-full transition-all duration-500 ease-out"
-                style={{
-                  width: `${progressPercent}%`,
-                  background: `linear-gradient(90deg, #8b5cf6, #d946ef)`,
-                }}
+                style={{ width: `${progressPercent}%`, background: `linear-gradient(90deg, #8b5cf6, #d946ef)` }}
               />
             </div>
 
-            {/* Current item info */}
             {currentItem && isProcessing && (
               <div className="bg-violet-500/5 border border-violet-500/10 rounded-xl p-3">
                 <div className="flex items-center gap-2 mb-1.5">
                   <Loader2 className="w-4 h-4 text-violet-400 animate-spin" />
-                  <span className="text-sm font-bold text-white truncate">
-                    {currentItem.title}
-                  </span>
+                  <span className="text-sm font-bold text-white truncate">{currentItem.title}</span>
                   <span className="text-[10px] bg-violet-500/20 text-violet-400 px-2 py-0.5 rounded-full font-bold ml-auto flex-shrink-0">
                     {currentItem.type}
                   </span>
@@ -552,22 +476,15 @@ export default function AutoProcessorPage() {
                 <div className="flex items-center gap-3 text-[11px] text-slate-500">
                   <span>{stepLabel[currentStep] || currentStep}</span>
                   {linkProgress && (
-                    <span className="text-violet-400 font-mono">
-                      Link {linkProgress.current}/{linkProgress.total}
-                    </span>
+                    <span className="text-violet-400 font-mono">Link {linkProgress.current}/{linkProgress.total}</span>
                   )}
                 </div>
 
-                {/* Link-level progress */}
                 {linkProgress && (
                   <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden mt-2">
                     <div
                       className="h-full bg-violet-500/60 rounded-full transition-all duration-300"
-                      style={{
-                        width: `${Math.round(
-                          (linkProgress.current / linkProgress.total) * 100
-                        )}%`,
-                      }}
+                      style={{ width: `${Math.round((linkProgress.current / linkProgress.total) * 100)}%` }}
                     />
                   </div>
                 )}
@@ -587,28 +504,15 @@ export default function AutoProcessorPage() {
                 <Clock className="w-3.5 h-3.5" />
                 Live Logs ({logs.length})
               </span>
-              {showLogs ? (
-                <ChevronDown className="w-4 h-4 text-slate-500" />
-              ) : (
-                <ChevronRight className="w-4 h-4 text-slate-500" />
-              )}
+              {showLogs ? <ChevronDown className="w-4 h-4 text-slate-500" /> : <ChevronRight className="w-4 h-4 text-slate-500" />}
             </button>
 
             {showLogs && (
               <div className="border-t border-white/5 max-h-80 overflow-y-auto px-4 py-2 font-mono text-[11px] leading-relaxed bg-black/30">
                 {logs.map((log, i) => (
-                  <div
-                    key={i}
-                    className={`flex gap-2 py-0.5 ${
-                      log.type === 'success'
-                        ? 'text-emerald-400'
-                        : log.type === 'error'
-                        ? 'text-rose-400'
-                        : log.type === 'warn'
-                        ? 'text-amber-400'
-                        : 'text-slate-400'
-                    }`}
-                  >
+                  <div key={i} className={`flex gap-2 py-0.5 ${
+                    log.type === 'success' ? 'text-emerald-400' : log.type === 'error' ? 'text-rose-400' : log.type === 'warn' ? 'text-amber-400' : 'text-slate-400'
+                  }`}>
                     <span className="text-slate-600 flex-shrink-0">{log.time}</span>
                     <span>{log.msg}</span>
                   </div>
@@ -630,42 +534,23 @@ export default function AutoProcessorPage() {
                 <Database className="w-3.5 h-3.5" />
                 Results ({processedItems.length})
               </span>
-              {showResults ? (
-                <ChevronDown className="w-4 h-4 text-slate-500" />
-              ) : (
-                <ChevronRight className="w-4 h-4 text-slate-500" />
-              )}
+              {showResults ? <ChevronDown className="w-4 h-4 text-slate-500" /> : <ChevronRight className="w-4 h-4 text-slate-500" />}
             </button>
 
             {showResults && (
               <div className="border-t border-white/5 divide-y divide-white/5">
                 {processedItems.map((item, i) => (
-                  <div
-                    key={i}
-                    className="px-5 py-3 flex items-center gap-3 hover:bg-white/[0.01]"
-                  >
-                    {item.status === 'completed' ? (
-                      <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" />
-                    ) : (
-                      <XCircle className="w-5 h-5 text-rose-400 flex-shrink-0" />
-                    )}
+                  <div key={i} className="px-5 py-3 flex items-center gap-3 hover:bg-white/[0.01]">
+                    {item.status === 'completed' ? <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" /> : <XCircle className="w-5 h-5 text-rose-400 flex-shrink-0" />}
                     <div className="min-w-0 flex-1">
-                      <p className="text-sm font-semibold text-white truncate">
-                        {item.title || item.queueItem.title}
-                      </p>
+                      <p className="text-sm font-semibold text-white truncate">{item.title || item.queueItem.title}</p>
                       <p className="text-[11px] text-slate-500 truncate">
-                        {item.status === 'completed'
-                          ? `Saved to ${item.savedCollection} • ${item.successfulLinks} links`
-                          : item.error || 'Failed'}
+                        {item.status === 'completed' ? `Saved to ${item.savedCollection} • ${item.successfulLinks} links` : item.error || 'Failed'}
                       </p>
                     </div>
-                    <span
-                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                        item.status === 'completed'
-                          ? 'bg-emerald-500/20 text-emerald-400'
-                          : 'bg-rose-500/20 text-rose-400'
-                      }`}
-                    >
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                      item.status === 'completed' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                    }`}>
                       {item.status}
                     </span>
                   </div>
@@ -679,31 +564,18 @@ export default function AutoProcessorPage() {
         {!isProcessing && queueItems.length > 0 && (
           <div className="bg-white/[0.02] border border-white/5 rounded-2xl overflow-hidden">
             <div className="px-5 py-3 border-b border-white/5">
-              <span className="text-xs font-bold text-slate-400 uppercase">
-                Pending Queue ({queueItems.length} items)
-              </span>
+              <span className="text-xs font-bold text-slate-400 uppercase">Pending Queue ({queueItems.length} items)</span>
             </div>
             <div className="divide-y divide-white/5 max-h-64 overflow-y-auto">
               {queueItems.map((item, i) => (
-                <div
-                  key={item.id}
-                  className="px-5 py-2.5 flex items-center gap-3 hover:bg-white/[0.01]"
-                >
-                  <span className="text-[10px] text-slate-600 font-mono w-6 text-right">
-                    {i + 1}
-                  </span>
-                  {item.type === 'webseries' ? (
-                    <Tv className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />
-                  ) : (
-                    <Film className="w-3.5 h-3.5 text-violet-400 flex-shrink-0" />
-                  )}
+                <div key={item.id} className="px-5 py-2.5 flex items-center gap-3 hover:bg-white/[0.01]">
+                  <span className="text-[10px] text-slate-600 font-mono w-6 text-right">{i + 1}</span>
+                  {item.type === 'webseries' ? <Tv className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" /> : <Film className="w-3.5 h-3.5 text-violet-400 flex-shrink-0" />}
                   <div className="min-w-0 flex-1">
                     <p className="text-xs font-medium text-slate-300 truncate">{item.title}</p>
                     <p className="text-[10px] text-slate-600 truncate">{item.url}</p>
                   </div>
-                  <span className="text-[9px] bg-amber-500/10 text-amber-400 px-1.5 py-0.5 rounded font-bold">
-                    {item.collection}
-                  </span>
+                  <span className="text-[9px] bg-amber-500/10 text-amber-400 px-1.5 py-0.5 rounded font-bold">{item.collection}</span>
                 </div>
               ))}
             </div>
@@ -715,10 +587,7 @@ export default function AutoProcessorPage() {
           <div className="text-center py-16 text-slate-500">
             <Zap className="w-16 h-16 mx-auto mb-4 opacity-10" />
             <p className="text-lg font-bold mb-1">No Pending Items</p>
-            <p className="text-sm opacity-60">
-              Add URLs to <code className="bg-white/5 px-1.5 py-0.5 rounded text-xs">movies_queue</code> or{' '}
-              <code className="bg-white/5 px-1.5 py-0.5 rounded text-xs">webseries_queue</code> in Firebase
-            </p>
+            <p className="text-sm opacity-60">Add URLs to <code className="bg-white/5 px-1.5 py-0.5 rounded text-xs">movies_queue</code> or <code className="bg-white/5 px-1.5 py-0.5 rounded text-xs">webseries_queue</code> in Firebase</p>
           </div>
         )}
       </div>
