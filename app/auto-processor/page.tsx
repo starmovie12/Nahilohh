@@ -291,6 +291,12 @@ export default function AutoProcessorPage() {
       } else {
         addLog(`❌ [${i + 1}/${itemsToProcess.length}] "${item.title}" — FAILED`, 'error');
       }
+
+      // --- ADDED SAFE DELAY BEFORE NEXT ITEM ---
+      if (i < itemsToProcess.length - 1 && !abortRef.current) {
+        addLog(`⏳ Taking a 3-second breather before the next URL...`, 'info');
+        await new Promise((r) => setTimeout(r, 3000));
+      }
     }
 
     addLog('─'.repeat(50), 'info');
@@ -414,7 +420,6 @@ export default function AutoProcessorPage() {
                 </>
               )}
             </div>
-            {/* NO TIMER UI - AS REQUESTED */}
           </div>
 
           {queueError && (
