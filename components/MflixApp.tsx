@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Bolt, Link as LinkIcon, Rocket, Loader2, RotateCcw, AlertTriangle, CircleCheck, History, ChevronRight, ChevronDown, Video, Film, Globe, Volume2, Sparkles, Home, Clock, CheckCircle2, XCircle, Trash2, RefreshCw, ExternalLink } from 'lucide-react';
+import { Bolt, Link as LinkIcon, Rocket, Loader2, RotateCcw, AlertTriangle, CircleCheck, History, ChevronRight, ChevronDown, Video, Film, Globe, Volume2, Sparkles, Home, Clock, CheckCircle2, XCircle, Trash2, RefreshCw, ExternalLink, Bot, StopCircle, ListVideo } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import LinkCard from '@/components/LinkCard';
 
@@ -76,6 +76,17 @@ export default function MflixApp() {
 
   const [deletingTaskId, setDeletingTaskId] = useState<string | null>(null);
   const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null);
+
+  // =========================================================================
+  // AUTO-PILOT STATE & REFS
+  // =========================================================================
+  const [isAutoPilot, setIsAutoPilot] = useState(false);
+  const [autoPilotQueue, setAutoPilotQueue] = useState<string[]>([]);
+  const [autoPilotStatus, setAutoPilotStatus] = useState<string>('');
+  const [autoPilotProcessed, setAutoPilotProcessed] = useState(0);
+  const [autoPilotTotal, setAutoPilotTotal] = useState(0);
+  const autoPilotActiveRef = useRef(false);
+  const autoPilotQueueRef = useRef<string[]>([]);
 
   const streamStartedRef = useRef<Set<string>>(new Set());
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -331,6 +342,152 @@ export default function MflixApp() {
     }
   }, []);
 
+  // =========================================================================
+  // AUTO-PILOT CORE LOGIC
+  // =========================================================================
+
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  const fetchPendingQueue = async (): Promise<string[]> => {
+    try {
+      // Try dedicated auto-process queue endpoint first
+      const res = await fetch('/api/auto-process/queue');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.urls) && data.urls.length > 0) return data.urls;
+        if (Array.isArray(data) && data.length > 0) return data;
+      }
+    } catch {}
+
+    // Fallback: extract pending/failed task URLs from existing tasks list
+    try {
+      const res = await fetch('/api/tasks');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          return data
+            .filter((t: Task) => t.status === 'failed' || t.status === 'processing')
+            .map((t: Task) => t.url);
+        }
+      }
+    } catch {}
+
+    return [];
+  };
+
+  const processUrlAutoPilot = async (targetUrl: string): Promise<void> => {
+    const trimmedUrl = targetUrl.trim();
+    if (!trimmedUrl) return;
+
+    const normalizeUrl = (u: string) =>
+      u.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '');
+
+    const existingTask = tasks.find(t => normalizeUrl(t.url) === normalizeUrl(trimmedUrl));
+    if (existingTask && getTrueTaskStatus(existingTask, getEffectiveStats(existingTask)) === 'completed') {
+      return; // skip already completed
+    }
+
+    try {
+      const response = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: trimmedUrl }),
+      });
+
+      if (!response.ok) return;
+      const data = await response.json();
+      if (data.error) return;
+
+      await fetchTasks();
+
+      if (data.taskId) {
+        setExpandedTask(data.taskId);
+        setActiveTab('processing');
+        completedLinksRef.current[data.taskId] = {};
+
+        try {
+          const taskRes = await fetch('/api/tasks');
+          if (taskRes.ok) {
+            const taskList = await taskRes.json();
+            const newTask = taskList.find((t: any) => t.id === data.taskId);
+            if (newTask?.links?.length > 0) {
+              await startLiveStream(data.taskId, newTask.links);
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+  };
+
+  const startAutoPilot = async () => {
+    setAutoPilotStatus('⏳ Fetching pending URLs...');
+    setAutoPilotProcessed(0);
+
+    const queue = await fetchPendingQueue();
+
+    if (queue.length === 0) {
+      setAutoPilotStatus('✅ Queue is empty — nothing to process!');
+      setIsAutoPilot(false);
+      autoPilotActiveRef.current = false;
+      return;
+    }
+
+    autoPilotQueueRef.current = [...queue];
+    setAutoPilotQueue([...queue]);
+    setAutoPilotTotal(queue.length);
+    setAutoPilotStatus(`🚀 Starting Auto-Pilot — ${queue.length} URLs in queue`);
+
+    let processed = 0;
+    for (const queuedUrl of queue) {
+      if (!autoPilotActiveRef.current) {
+        setAutoPilotStatus('🛑 Auto-Pilot stopped by user.');
+        break;
+      }
+
+      setUrl(queuedUrl);
+      setAutoPilotStatus(`⚡ Processing (${processed + 1}/${queue.length}): ${queuedUrl.slice(0, 50)}...`);
+
+      await processUrlAutoPilot(queuedUrl);
+
+      processed++;
+      setAutoPilotProcessed(processed);
+
+      if (!autoPilotActiveRef.current) {
+        setAutoPilotStatus('🛑 Auto-Pilot stopped by user.');
+        break;
+      }
+
+      if (processed < queue.length) {
+        setAutoPilotStatus(`✅ Done (${processed}/${queue.length}) — Waiting 3s before next...`);
+        await sleep(3000);
+      }
+    }
+
+    if (autoPilotActiveRef.current) {
+      setAutoPilotStatus(`🎉 Auto-Pilot complete! Processed ${processed} URL${processed !== 1 ? 's' : ''}.`);
+    }
+
+    autoPilotActiveRef.current = false;
+    setIsAutoPilot(false);
+    setUrl('');
+  };
+
+  const handleToggleAutoPilot = () => {
+    if (isAutoPilot) {
+      // STOP
+      autoPilotActiveRef.current = false;
+      setIsAutoPilot(false);
+    } else {
+      // START
+      autoPilotActiveRef.current = true;
+      setIsAutoPilot(true);
+      setAutoPilotQueue([]);
+      setAutoPilotTotal(0);
+      setAutoPilotProcessed(0);
+      startAutoPilot();
+    }
+  };
+
   const startProcess = async () => {
     const trimmedUrl = url.trim();
     if (!trimmedUrl) return;
@@ -565,6 +722,71 @@ export default function MflixApp() {
               <button onClick={() => setError(null)} className="text-xs font-bold uppercase hover:text-emerald-300">Dismiss</button>
             </motion.div>
           )}
+
+          {/* ================================================================ */}
+          {/* AUTO-PILOT SECTION                                               */}
+          {/* ================================================================ */}
+          <div className="mt-4 border border-dashed border-white/10 rounded-2xl p-4 bg-black/20">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Bot className={`w-5 h-5 ${isAutoPilot ? 'text-violet-400 animate-pulse' : 'text-slate-500'}`} />
+                <div>
+                  <p className="text-xs font-bold text-slate-300 uppercase tracking-wider">Auto-Pilot Mode</p>
+                  <p className="text-[10px] text-slate-500">Automatically processes all pending URLs from queue</p>
+                </div>
+              </div>
+              <button
+                onClick={handleToggleAutoPilot}
+                disabled={isConnecting || isProcessing}
+                className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-sm transition-all active:scale-95 disabled:opacity-50 ${
+                  isAutoPilot
+                    ? 'bg-rose-500/20 border border-rose-500/40 text-rose-400 hover:bg-rose-500/30'
+                    : 'bg-violet-600/20 border border-violet-500/40 text-violet-400 hover:bg-violet-600/30'
+                }`}
+              >
+                {isAutoPilot ? (
+                  <><StopCircle className="w-4 h-4" />Stop</>
+                ) : (
+                  <><Bot className="w-4 h-4" />Start</>
+                )}
+              </button>
+            </div>
+
+            <AnimatePresence>
+              {(isAutoPilot || autoPilotStatus) && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="mt-3 overflow-hidden"
+                >
+                  {/* Status bar */}
+                  <div className="flex items-center gap-2 bg-black/30 rounded-xl px-3 py-2.5 mb-2">
+                    {isAutoPilot && <Loader2 className="w-3.5 h-3.5 text-violet-400 animate-spin flex-shrink-0" />}
+                    <p className="text-[11px] text-slate-300 font-mono truncate">{autoPilotStatus}</p>
+                  </div>
+
+                  {/* Progress bar */}
+                  {autoPilotTotal > 0 && (
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] text-slate-500 font-mono">
+                        <span className="flex items-center gap-1"><ListVideo className="w-3 h-3" />{autoPilotProcessed}/{autoPilotTotal} URLs</span>
+                        <span>{Math.round((autoPilotProcessed / autoPilotTotal) * 100)}%</span>
+                      </div>
+                      <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
+                        <motion.div
+                          className="h-full bg-gradient-to-r from-violet-500 to-indigo-500 rounded-full"
+                          initial={{ width: 0 }}
+                          animate={{ width: `${(autoPilotProcessed / autoPilotTotal) * 100}%` }}
+                          transition={{ duration: 0.4 }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
         </section>
       )}
 
